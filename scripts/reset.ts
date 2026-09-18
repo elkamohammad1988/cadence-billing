@@ -23,48 +23,63 @@ import postgres from 'postgres'
 
 const DEMO_EMAIL_DOMAIN = '@cadence.test'
 
+/**
+ * Enumerated from the catalog rather than hand-listed.
+ *
+ * The previous version named every object explicitly, which meant that adding
+ * a table and forgetting to add it here produced a "fresh" database that
+ * quietly still had the old one in it — the worst possible outcome for a reset.
+ *
+ * Scope: everything in `public`, plus the `app` schema. Supabase's own schemas
+ * (auth, storage, realtime) are untouched apart from the demo users deleted
+ * separately below. On a project dedicated to this app that is what "reset"
+ * should mean; the script prints what it is about to drop so the assumption is
+ * visible rather than implied.
+ */
 const TEARDOWN = `
-  drop view   if exists public.workspace_entitlements cascade;
+  do $teardown$
+  declare
+    r record;
+  begin
+    -- Views first: a view over a table being dropped would go anyway via
+    -- cascade, but dropping it explicitly keeps the notice output readable.
+    for r in
+      select table_name from information_schema.views where table_schema = 'public'
+    loop
+      execute format('drop view if exists public.%I cascade', r.table_name);
+    end loop;
 
-  drop table  if exists public.stripe_event_attempts  cascade;
-  drop table  if exists public.stripe_events          cascade;
-  drop table  if exists public.audit_log              cascade;
-  drop table  if exists public.payment_failures       cascade;
-  drop table  if exists public.invoices               cascade;
-  drop table  if exists public.subscriptions          cascade;
-  drop table  if exists public.billing_customers      cascade;
-  drop table  if exists public.billing_config         cascade;
-  drop table  if exists public.notes                  cascade;
-  drop table  if exists public.projects               cascade;
-  drop table  if exists public.workspace_members      cascade;
-  drop table  if exists public.workspaces             cascade;
-  drop table  if exists public.plan_prices            cascade;
-  drop table  if exists public.plans                  cascade;
-  drop table  if exists public.profiles               cascade;
+    for r in
+      select tablename from pg_tables where schemaname = 'public'
+    loop
+      execute format('drop table if exists public.%I cascade', r.tablename);
+    end loop;
 
-  drop type   if exists public.audit_actor_type    cascade;
-  drop type   if exists public.stripe_event_status cascade;
-  drop type   if exists public.invoice_status      cascade;
-  drop type   if exists public.workspace_role      cascade;
-  drop type   if exists public.subscription_source cascade;
-  drop type   if exists public.billing_interval    cascade;
-  drop type   if exists public.subscription_status cascade;
+    -- Enum types are not reached by dropping the tables that use them.
+    for r in
+      select t.typname
+        from pg_type t
+        join pg_namespace n on n.oid = t.typnamespace
+       where n.nspname = 'public'
+         and t.typtype = 'e'
+    loop
+      execute format('drop type if exists public.%I cascade', r.typname);
+    end loop;
+  end
+  $teardown$;
 
   -- Takes the SECURITY DEFINER helpers and the trigger functions with it. The
   -- trigger on auth.users depends on app.handle_new_auth_user(), so this must
   -- cascade or the drop fails.
   drop schema if exists app cascade;
 
-  -- Guarded: on a project that has never been migrated by either this script
-  -- or the Supabase CLI, the schema does not exist and an unguarded DELETE
-  -- fails with "schema does not exist".
+  -- Everything the ledger recorded has just been dropped, so the ledger must
+  -- not go on claiming it exists. Guarded because the schema is absent on a
+  -- project neither this script nor the CLI has ever migrated.
   do $guard$
   begin
     if to_regclass('supabase_migrations.schema_migrations') is not null then
-      delete from supabase_migrations.schema_migrations
-      where name in (
-        'extensions_and_types', 'tables', 'functions', 'triggers', 'rls', 'plan_catalogue'
-      );
+      delete from supabase_migrations.schema_migrations;
     end if;
   end
   $guard$;
@@ -104,7 +119,30 @@ async function main() {
   const sql = postgres(url, { max: 1, prepare: false, onnotice: () => {} })
 
   try {
-    console.log('Dropping Cadence objects…')
+    // Print the inventory before destroying it. The teardown drops everything
+    // in `public`, not just tables this project created, and that is a big
+    // enough claim to show rather than assert.
+    const inventory = await sql<{ kind: string; name: string }[]>`
+      select 'table' as kind, tablename as name from pg_tables where schemaname = 'public'
+      union all
+      select 'view', table_name from information_schema.views where table_schema = 'public'
+      union all
+      select 'type', t.typname
+        from pg_type t
+        join pg_namespace n on n.oid = t.typnamespace
+       where n.nspname = 'public' and t.typtype = 'e'
+      order by kind, name
+    `
+
+    if (inventory.length === 0) {
+      console.log('Nothing in public to drop.')
+    } else {
+      console.log(`Dropping ${inventory.length} object(s) from public:`)
+      for (const item of inventory) {
+        console.log(`  ${item.kind.padEnd(6)} ${item.name}`)
+      }
+    }
+
     await sql.unsafe(TEARDOWN).simple()
 
     // auth.users rows outlive the public schema, and their ids are referenced
