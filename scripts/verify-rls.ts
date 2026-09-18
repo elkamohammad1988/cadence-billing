@@ -223,18 +223,55 @@ async function main() {
     console.log(`\n4. app.limits_bypassed() cannot be reached by an untrusted caller`)
     await sql.begin(async (tx) => {
       await asUser(tx, owner.id)
-      // Any role may set a custom GUC. That is exactly why the function does
-      // not trust it on its own.
-      await tx.unsafe(`set local app.bypass_limits = 'on'`)
+      // Any role may set a custom GUC, so forge the token properly: read the
+      // real transaction id and set the GUC to exactly what the helper would
+      // have written. Only the session_user check should stand in the way.
+      const [xid] = await tx<{ id: string }[]>`select pg_current_xact_id()::text as id`
+      await tx.unsafe(`set local app.bypass_limits = '${xid!.id}'`)
       const [row] = await tx<{ bypassed: boolean; who: string }[]>`
         select app.limits_bypassed() as bypassed, session_user as who
       `
       record(
-        'authenticated setting the GUC does not bypass',
+        'authenticated forging a valid token does not bypass',
         row?.bypassed === false,
         `limits_bypassed()=${row?.bypassed} session_user=${row?.who}`,
       )
     })
+
+    // Separate transaction: the raise aborts it, and anything after a failed
+    // statement in the same transaction fails too.
+    try {
+      await sql.begin(async (tx) => {
+        await asUser(tx, owner.id)
+        await tx`select app.begin_privileged_writes()`
+      })
+      record('authenticated cannot call begin_privileged_writes()', false, 'helper did not refuse')
+    } catch (error) {
+      const pgError = error as { code?: string; message?: string }
+      record(
+        'authenticated cannot call begin_privileged_writes()',
+        pgError.code === '42501',
+        `SQLSTATE ${pgError.code ?? '?'} — ${(pgError.message ?? '').split('\n')[0]}`,
+      )
+    }
+
+    // The property the transaction-id token buys: a session-level SET, the
+    // mistake this design is meant to survive, authorises nothing later.
+    await sql.begin(async (tx) => {
+      const [xid] = await tx<{ id: string }[]>`select pg_current_xact_id()::text as id`
+      // Deliberately NOT `set local` — this is the leak being simulated.
+      await tx.unsafe(`set app.bypass_limits = '${xid!.id}'`)
+    })
+    const [leaked] = await sql<{ bypassed: boolean; setting: string | null }[]>`
+      select app.limits_bypassed() as bypassed,
+             current_setting('app.bypass_limits', true) as setting
+    `
+    record(
+      'a leaked session-level token is inert in later transactions',
+      leaked?.bypassed === false,
+      `GUC still set to ${leaked?.setting ?? 'null'}, limits_bypassed()=${leaked?.bypassed}`,
+    )
+    await sql.unsafe(`reset app.bypass_limits`)
 
     // --- 4b. Same attempt over HTTP with the service-role key ------------
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
@@ -279,7 +316,7 @@ async function main() {
     // --- 4c. A direct privileged connection may bypass -------------------
     try {
       await sql.begin(async (tx) => {
-        await tx.unsafe(`set local app.bypass_limits = 'on'`)
+        await tx`select app.begin_privileged_writes()`
         const [row] = await tx<{ bypassed: boolean }[]>`select app.limits_bypassed() as bypassed`
         const inserted = await tx<{ id: string }[]>`
           insert into public.projects (workspace_id, name, created_by)

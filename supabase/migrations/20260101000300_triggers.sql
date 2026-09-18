@@ -200,32 +200,65 @@ create trigger audit_log_append_only
 
 -- --- Limit enforcement -----------------------------------------------------
 
--- Escape hatch for privileged, non-user-triggered writes that legitimately
--- need to land a row the current plan would refuse:
+-- Escape hatch for privileged writes that legitimately need to land a row the
+-- current plan would refuse: the seed building workspaces before their
+-- subscriptions exist, reconciliation repairing a row to match Stripe, an
+-- audited admin grant.
 --
---   * the seed script, building demo workspaces before their subscriptions
---     exist
---   * reconciliation, repairing a row to match what Stripe says is true
---   * an admin manual grant or a support fix, which is audited
+-- The only supported way in is app.begin_privileged_writes(). Callers never
+-- touch the GUC; the helper sets it, and sets it transaction-locally.
 --
--- Two conditions, both required. The GUC alone would be worthless: Postgres
--- places no privilege check on custom configuration parameters, so
--- `authenticated` can happily `set app.bypass_limits = 'on'` and switch off
--- its own plan limits. The identity check is what closes that.
+-- What this guarantees, precisely:
 --
--- It tests `session_user`, not `current_user`, for a reason that is easy to get
--- wrong: the callers are SECURITY DEFINER trigger functions, and inside those
--- `current_user` has already been rewritten to the function owner (`postgres`).
--- Reading it here would return `postgres` for every caller and the check would
--- pass for everyone. `session_user` is untouched by SECURITY DEFINER and
--- reports the role that actually opened the connection:
+--   * A caller arriving through PostgREST cannot bypass a limit, whatever key
+--     it holds, because session_user is `authenticator` there rather than
+--     `postgres`. Note this is a much smaller claim than it sounds: a request
+--     holding the service-role key already bypasses all of RLS and can read
+--     and write every tenant's billing data. Blocking it from exceeding a
+--     project quota is not a security boundary, it is a guard against
+--     accidental limit-busting from the REST path.
 --
---   direct connection (webhook, reconciliation, admin, seed)  -> postgres
---   anything arriving through PostgREST                       -> authenticator
+--   * A bypass cannot leak across a pooled connection. This is the property
+--     worth having, and it is why the token is the transaction id rather than
+--     a constant. Set the GUC session-wide by mistake and it authorises
+--     nothing after the current transaction commits, because every later
+--     transaction has a different id.
 --
--- So a request carrying the service-role *key* over HTTP still cannot bypass a
--- limit. Only code holding a direct database connection can, which is exactly
--- the set of callers this is for.
+-- What it does not guarantee: anything at all against code that already holds
+-- a direct `postgres` connection. Such code can call the helper itself. The
+-- boundary is the connection, not the function.
+--
+-- session_user, not current_user: the callers are SECURITY DEFINER triggers,
+-- and inside those current_user has already been rewritten to the function
+-- owner (`postgres`), so reading it would return `postgres` for every caller
+-- and pass for everyone. session_user is untouched by SECURITY DEFINER.
+create or replace function app.begin_privileged_writes()
+returns void
+language plpgsql
+volatile
+security definer
+set search_path = ''
+as $$
+begin
+  if session_user not in ('postgres', 'supabase_admin') then
+    raise exception 'privileged writes require a direct database connection'
+      using errcode = '42501',
+            detail = format('session_user is %L', session_user);
+  end if;
+
+  -- is_local => true is SET LOCAL. Called outside an explicit transaction it
+  -- still applies, but only for that one statement, so the bypass simply does
+  -- not reach any later INSERT. That is the correct failure mode.
+  perform set_config('app.bypass_limits', pg_current_xact_id()::text, true);
+end;
+$$;
+
+comment on function app.begin_privileged_writes() is
+  'Opens a transaction-scoped bypass of the plan limit triggers. Direct postgres connections only. The token is the transaction id, so a leaked session-level setting authorises nothing.';
+
+revoke execute on function app.begin_privileged_writes() from public;
+
+
 create or replace function app.limits_bypassed()
 returns boolean
 language sql
@@ -233,13 +266,18 @@ stable
 security definer
 set search_path = ''
 as $$
-  select coalesce(current_setting('app.bypass_limits', true), 'off') = 'on'
-     and session_user in ('postgres', 'supabase_admin');
+  select coalesce(
+    session_user in ('postgres', 'supabase_admin')
+      and current_setting('app.bypass_limits', true)
+          = pg_current_xact_id_if_assigned()::text,
+    false
+  );
 $$;
 
 comment on function app.limits_bypassed() is
-  'True only for a direct privileged connection that has explicitly opted out of limit triggers. Tests session_user because SECURITY DEFINER rewrites current_user.';
+  'True only inside a transaction that called app.begin_privileged_writes(). Read by the limit triggers.';
 
+revoke execute on function app.limits_bypassed() from public;
 grant execute on function app.limits_bypassed() to service_role;
 
 

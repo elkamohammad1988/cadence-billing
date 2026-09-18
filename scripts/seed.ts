@@ -136,8 +136,9 @@ async function main() {
 
   try {
     await sql.begin(async (tx) => {
-      // Must be literal: `set local` does not take a bind parameter.
-      await tx.unsafe(`set local app.bypass_limits = 'on'`)
+      // Opens the transaction-scoped bypass of the limit triggers. Must be
+      // inside this transaction to have any effect.
+      await tx`select app.begin_privileged_writes()`
 
       // --- Clean slate for the demo tenants --------------------------------
       // Cascades remove members, projects, notes, subscriptions, invoices and
