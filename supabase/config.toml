@@ -1,0 +1,68 @@
+# Supabase local development configuration.
+#
+#   pnpm db:start   -> starts Postgres, Auth, PostgREST and Studio in Docker
+#   pnpm db:stop    -> stops them
+#   supabase db reset -> drops, re-runs every migration in supabase/migrations
+#
+# `supabase start` prints the anon key, the service role key and the DB URL.
+# Copy them into .env.local and .env.
+
+project_id = "cadence-billing"
+
+[api]
+enabled = true
+port = 54321
+# `app` is deliberately absent. The SECURITY DEFINER helpers that RLS policies
+# call live there, and nothing in that schema should be reachable over REST.
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 15
+
+[db.pooler]
+enabled = false
+port = 54329
+pool_mode = "transaction"
+
+[studio]
+enabled = true
+port = 54323
+api_url = "http://127.0.0.1:54321"
+
+# Catches outbound mail locally so signup and invite flows can be exercised
+# without a mail provider. Inbox at http://127.0.0.1:54324.
+[inbucket]
+enabled = true
+port = 54324
+
+[storage]
+enabled = false
+
+[auth]
+enabled = true
+site_url = "http://localhost:3000"
+additional_redirect_urls = ["http://localhost:3000/auth/callback"]
+jwt_expiry = 3600
+enable_refresh_token_rotation = true
+refresh_token_reuse_interval = 10
+enable_signup = true
+enable_anonymous_sign_ins = false
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = true
+# Off locally so the seed script and the Playwright suite can sign users in
+# immediately. This is a local-only setting; hosted projects keep confirmation
+# on — see docs/GOING-LIVE.md.
+enable_confirmations = false
+secure_password_change = false
+
+[auth.sessions]
+timebox = "24h"
+
+[analytics]
+enabled = false

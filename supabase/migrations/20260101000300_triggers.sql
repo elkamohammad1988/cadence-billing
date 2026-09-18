@@ -1,0 +1,362 @@
+-- ===========================================================================
+-- 0003 — Triggers
+-- ===========================================================================
+-- Two kinds live here:
+--
+--   * housekeeping    — updated_at, profile creation, denormalisation
+--   * limit enforcement — the serialised half of entitlement enforcement
+--
+-- On the second: an RLS WITH CHECK clause that counts rows is racy. Two
+-- concurrent inserts can both observe "2 projects, limit 3" and both commit,
+-- landing at 4. The policy is still worth having — it produces a clean
+-- permission-denied and documents intent — but the trigger is what makes the
+-- limit true. It takes a transaction-scoped advisory lock keyed on the
+-- workspace, so concurrent inserts into the same workspace serialise while
+-- inserts into different workspaces do not contend.
+--
+-- Error codes (class CD is unused by the SQL standard, so these cannot be
+-- confused with a built-in failure):
+--   CD001  project limit exceeded
+--   CD002  seat limit exceeded
+--   CD003  workspace limit exceeded
+-- ===========================================================================
+
+
+-- --- Housekeeping ----------------------------------------------------------
+
+create or replace function app.set_updated_at()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$;
+
+
+create trigger profiles_set_updated_at
+  before update on public.profiles
+  for each row execute function app.set_updated_at();
+
+create trigger plans_set_updated_at
+  before update on public.plans
+  for each row execute function app.set_updated_at();
+
+create trigger plan_prices_set_updated_at
+  before update on public.plan_prices
+  for each row execute function app.set_updated_at();
+
+create trigger workspaces_set_updated_at
+  before update on public.workspaces
+  for each row execute function app.set_updated_at();
+
+create trigger projects_set_updated_at
+  before update on public.projects
+  for each row execute function app.set_updated_at();
+
+create trigger notes_set_updated_at
+  before update on public.notes
+  for each row execute function app.set_updated_at();
+
+create trigger billing_customers_set_updated_at
+  before update on public.billing_customers
+  for each row execute function app.set_updated_at();
+
+create trigger subscriptions_set_updated_at
+  before update on public.subscriptions
+  for each row execute function app.set_updated_at();
+
+create trigger invoices_set_updated_at
+  before update on public.invoices
+  for each row execute function app.set_updated_at();
+
+create trigger billing_config_set_updated_at
+  before update on public.billing_config
+  for each row execute function app.set_updated_at();
+
+
+-- Every auth.users row gets a profile. Doing this in the database rather than
+-- in a signup handler means a user created through any path — the Supabase
+-- dashboard, the admin API, the seed script — still ends up with a profile.
+create or replace function app.handle_new_auth_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  insert into public.profiles (id, email, full_name, avatar_url)
+  values (
+    new.id,
+    new.email,
+    nullif(new.raw_user_meta_data ->> 'full_name', ''),
+    nullif(new.raw_user_meta_data ->> 'avatar_url', '')
+  )
+  on conflict (id) do update
+    set email = excluded.email,
+        updated_at = now();
+  return new;
+end;
+$$;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function app.handle_new_auth_user();
+
+
+-- The owner is a member. Making this a trigger rather than two inserts in
+-- application code removes the window in which a workspace exists with no
+-- members and is therefore invisible to its own creator under RLS.
+create or replace function app.add_owner_as_member()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  insert into public.workspace_members (workspace_id, user_id, role)
+  values (new.id, new.owner_id, 'owner')
+  on conflict (workspace_id, user_id) do nothing;
+  return new;
+end;
+$$;
+
+create trigger workspaces_add_owner_member
+  after insert on public.workspaces
+  for each row execute function app.add_owner_as_member();
+
+
+-- notes.workspace_id is denormalised so RLS can scope without joining through
+-- projects. Derived here rather than trusted from the client, so it cannot be
+-- forged into pointing at another tenant.
+create or replace function app.notes_inherit_workspace()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_workspace_id uuid;
+begin
+  select pr.workspace_id into v_workspace_id
+  from public.projects pr
+  where pr.id = new.project_id;
+
+  if v_workspace_id is null then
+    raise exception 'project % does not exist', new.project_id
+      using errcode = '23503';
+  end if;
+
+  new.workspace_id := v_workspace_id;
+  return new;
+end;
+$$;
+
+create trigger notes_inherit_workspace
+  before insert or update of project_id on public.notes
+  for each row execute function app.notes_inherit_workspace();
+
+
+-- Append-only audit trail. Enforced in the database because the whole point of
+-- an audit entry is that the person being audited cannot remove it — and the
+-- admin area runs with the service role, which bypasses RLS.
+create or replace function app.reject_mutation()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  raise exception 'audit_log is append-only'
+    using errcode = '42501';
+end;
+$$;
+
+create trigger audit_log_append_only
+  before update or delete on public.audit_log
+  for each row execute function app.reject_mutation();
+
+
+-- --- Limit enforcement -----------------------------------------------------
+
+-- Escape hatch for privileged, non-user-triggered writes that legitimately
+-- need to land a row the current plan would refuse:
+--
+--   * the seed script, building demo workspaces before their subscriptions
+--     exist
+--   * reconciliation, repairing a row to match what Stripe says is true
+--   * an admin manual grant or a support fix, which is audited
+--
+-- Two conditions, both required. The GUC alone would be worthless: Postgres
+-- places no privilege check on custom configuration parameters, so
+-- `authenticated` can happily `set app.bypass_limits = 'on'` and switch off
+-- its own plan limits. The identity check is what closes that.
+--
+-- It tests `session_user`, not `current_user`, for a reason that is easy to get
+-- wrong: the callers are SECURITY DEFINER trigger functions, and inside those
+-- `current_user` has already been rewritten to the function owner (`postgres`).
+-- Reading it here would return `postgres` for every caller and the check would
+-- pass for everyone. `session_user` is untouched by SECURITY DEFINER and
+-- reports the role that actually opened the connection:
+--
+--   direct connection (webhook, reconciliation, admin, seed)  -> postgres
+--   anything arriving through PostgREST                       -> authenticator
+--
+-- So a request carrying the service-role *key* over HTTP still cannot bypass a
+-- limit. Only code holding a direct database connection can, which is exactly
+-- the set of callers this is for.
+create or replace function app.limits_bypassed()
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select coalesce(current_setting('app.bypass_limits', true), 'off') = 'on'
+     and session_user in ('postgres', 'supabase_admin');
+$$;
+
+comment on function app.limits_bypassed() is
+  'True only for a direct privileged connection that has explicitly opted out of limit triggers. Tests session_user because SECURITY DEFINER rewrites current_user.';
+
+grant execute on function app.limits_bypassed() to service_role;
+
+
+create or replace function app.enforce_project_limit()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_plan  public.plans;
+  v_count integer;
+begin
+  -- Only inserts and un-archiving consume quota. An update that leaves a
+  -- project archived, or edits its name, must not be blocked by a limit the
+  -- workspace already exceeds.
+  if tg_op = 'UPDATE' and not (old.archived_at is not null and new.archived_at is null) then
+    return new;
+  end if;
+
+  if app.limits_bypassed() then
+    return new;
+  end if;
+
+  perform pg_advisory_xact_lock(hashtext('cadence:projects'), hashtext(new.workspace_id::text));
+
+  v_plan := app.effective_plan(new.workspace_id);
+
+  if v_plan.max_projects is null then
+    return new;
+  end if;
+
+  select count(*)::integer into v_count
+  from public.projects pr
+  where pr.workspace_id = new.workspace_id
+    and pr.archived_at is null
+    and pr.id is distinct from new.id;
+
+  if v_count >= v_plan.max_projects then
+    raise exception
+      'project limit reached: the % plan allows % active project(s) and this workspace has %',
+      v_plan.name, v_plan.max_projects, v_count
+      using errcode = 'CD001',
+            hint = 'Upgrade the plan or archive an existing project.';
+  end if;
+
+  return new;
+end;
+$$;
+
+create trigger projects_enforce_limit
+  before insert or update of archived_at on public.projects
+  for each row execute function app.enforce_project_limit();
+
+
+create or replace function app.enforce_seat_limit()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_plan  public.plans;
+  v_count integer;
+begin
+  if app.limits_bypassed() then
+    return new;
+  end if;
+
+  perform pg_advisory_xact_lock(hashtext('cadence:seats'), hashtext(new.workspace_id::text));
+
+  v_plan := app.effective_plan(new.workspace_id);
+
+  if v_plan.max_seats is null then
+    return new;
+  end if;
+
+  select count(*)::integer into v_count
+  from public.workspace_members m
+  where m.workspace_id = new.workspace_id
+    and m.id is distinct from new.id;
+
+  if v_count >= v_plan.max_seats then
+    raise exception
+      'seat limit reached: the % plan allows % seat(s) and this workspace has %',
+      v_plan.name, v_plan.max_seats, v_count
+      using errcode = 'CD002',
+            hint = 'Upgrade the plan or remove a member.';
+  end if;
+
+  return new;
+end;
+$$;
+
+create trigger workspace_members_enforce_limit
+  before insert on public.workspace_members
+  for each row execute function app.enforce_seat_limit();
+
+
+create or replace function app.enforce_workspace_limit()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_allowance integer;
+  v_count     integer;
+begin
+  if app.limits_bypassed() then
+    return new;
+  end if;
+
+  perform pg_advisory_xact_lock(hashtext('cadence:workspaces'), hashtext(new.owner_id::text));
+
+  v_allowance := app.user_workspace_allowance(new.owner_id);
+
+  select count(*)::integer into v_count
+  from public.workspaces w
+  where w.owner_id = new.owner_id
+    and w.archived_at is null
+    and w.id is distinct from new.id;
+
+  if v_count >= v_allowance then
+    raise exception
+      'workspace limit reached: this account may own % workspace(s) and already owns %',
+      v_allowance, v_count
+      using errcode = 'CD003',
+            hint = 'Upgrade one of your existing workspaces to raise the limit.';
+  end if;
+
+  return new;
+end;
+$$;
+
+create trigger workspaces_enforce_limit
+  before insert on public.workspaces
+  for each row execute function app.enforce_workspace_limit();
