@@ -104,16 +104,23 @@ export const billingConfig = pgTable('billing_config', {
  * Append-only; a database trigger rejects UPDATE and DELETE. Every privileged
  * mutation writes here: manual plan grants, webhook replays, forced
  * downgrades, reconciliation repairs.
+ *
+ * `actorId` and `workspaceId` carry no foreign key on purpose. An audit entry
+ * has to outlive its subject — "who deleted this workspace" is a question you
+ * ask after the workspace is gone. And mechanically an FK cannot work here at
+ * all: `on delete set null` is an UPDATE and `on delete cascade` is a DELETE,
+ * and the append-only trigger rejects both, so either one would make deleting
+ * a workspace fail. Joins against these columns must tolerate a missing row.
  */
 export const auditLog = pgTable(
   'audit_log',
   {
     id: uuid('id').primaryKey().defaultRandom(),
     actorType: auditActorType('actor_type').notNull(),
-    actorId: uuid('actor_id').references(() => profiles.id, { onDelete: 'set null' }),
+    actorId: uuid('actor_id'),
     /** Captured at write time; the actor may later be deleted. */
     actorEmail: text('actor_email'),
-    workspaceId: uuid('workspace_id').references(() => workspaces.id, { onDelete: 'set null' }),
+    workspaceId: uuid('workspace_id'),
     /** Dotted verb, e.g. 'billing.plan_granted', 'webhook.replayed'. */
     action: text('action').notNull(),
     reason: text('reason'),

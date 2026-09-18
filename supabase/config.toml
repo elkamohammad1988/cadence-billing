@@ -1,11 +1,25 @@
-# Supabase local development configuration.
+# Supabase CLI configuration.
 #
-#   pnpm db:start   -> starts Postgres, Auth, PostgREST and Studio in Docker
-#   pnpm db:stop    -> stops them
-#   supabase db reset -> drops, re-runs every migration in supabase/migrations
+# ---------------------------------------------------------------------------
+# THIS PROJECT DEVELOPS AGAINST A HOSTED SUPABASE PROJECT, NOT A LOCAL STACK.
+# ---------------------------------------------------------------------------
 #
-# `supabase start` prints the anon key, the service role key and the DB URL.
-# Copy them into .env.local and .env.
+# Almost everything in this file describes `supabase start`, which runs the
+# whole stack in Docker. We do not use it. Migrations are applied to the hosted
+# project with `pnpm db:migrate`, which talks to DATABASE_URL directly and
+# needs neither Docker nor the CLI.
+#
+# The file is kept for two reasons:
+#
+#   1. `supabase link --project-ref <ref>` expects it, and linking is what
+#      enables `supabase db pull` / `db push` / `db diff` if you ever want the
+#      CLI's own migration tooling as a cross-check.
+#   2. The [auth] block below can be pushed to the hosted project with
+#      `supabase config push`, so the auth settings this app assumes are
+#      recorded in the repo rather than clicked into a dashboard.
+#
+# The port numbers only matter if someone later runs `supabase start` with
+# Docker installed. They are harmless otherwise.
 
 project_id = "cadence-billing"
 
@@ -14,6 +28,9 @@ enabled = true
 port = 54321
 # `app` is deliberately absent. The SECURITY DEFINER helpers that RLS policies
 # call live there, and nothing in that schema should be reachable over REST.
+#
+# This is load-bearing for more than tidiness: app.limits_bypassed() must not
+# be callable by an HTTP client, whatever key it holds.
 schemas = ["public", "graphql_public"]
 extra_search_path = ["public", "extensions"]
 max_rows = 1000
@@ -21,6 +38,9 @@ max_rows = 1000
 [db]
 port = 54322
 shadow_port = 54320
+# Match this to the hosted project's Postgres major version, which the
+# dashboard shows under Settings -> Infrastructure. `supabase db diff` produces
+# wrong output when it disagrees.
 major_version = 15
 
 [db.pooler]
@@ -33,8 +53,13 @@ enabled = true
 port = 54323
 api_url = "http://127.0.0.1:54321"
 
-# Catches outbound mail locally so signup and invite flows can be exercised
-# without a mail provider. Inbox at http://127.0.0.1:54324.
+# Local mail catcher. Not available against a hosted project: a hosted project
+# sends real email through whatever SMTP provider it is configured with, or
+# through Supabase's rate-limited default sender.
+#
+# This is the one real casualty of dropping the local stack. See the note on
+# email in README.md — the seed works around it by creating users with
+# email_confirm set, so no confirmation mail is ever needed for demo accounts.
 [inbucket]
 enabled = true
 port = 54324
@@ -42,8 +67,16 @@ port = 54324
 [storage]
 enabled = false
 
+# ---------------------------------------------------------------------------
+# The block below is the one worth pushing to the hosted project:
+#   supabase link --project-ref <ref>
+#   supabase config push
+# ---------------------------------------------------------------------------
+
 [auth]
 enabled = true
+# Must match NEXT_PUBLIC_APP_URL. Stripe redirects and auth callbacks both
+# resolve against it, and a mismatch shows up as a silent redirect failure.
 site_url = "http://localhost:3000"
 additional_redirect_urls = ["http://localhost:3000/auth/callback"]
 jwt_expiry = 3600
@@ -55,10 +88,11 @@ enable_anonymous_sign_ins = false
 [auth.email]
 enable_signup = true
 double_confirm_changes = true
-# Off locally so the seed script and the Playwright suite can sign users in
-# immediately. This is a local-only setting; hosted projects keep confirmation
-# on — see docs/GOING-LIVE.md.
-enable_confirmations = false
+# Kept ON for the hosted project, because it is the real default and turning it
+# off on a hosted project leaves an open signup endpoint that mints confirmed
+# accounts for any address. Demo users sidestep it via the admin API; the
+# Playwright suite will do the same rather than reading a mailbox.
+enable_confirmations = true
 secure_password_change = false
 
 [auth.sessions]

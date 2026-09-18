@@ -11,8 +11,14 @@ import postgres from 'postgres'
  * the objects it created and nothing else. Supabase's own schemas — auth,
  * storage, realtime — are untouched apart from the demo users.
  *
- * Refuses to run against anything that does not look local unless
- * `--force` is passed. The mistake this prevents is the expensive kind.
+ * The development database is a hosted Supabase project, not a disposable
+ * container, so the guard cannot be "is this localhost". Instead the
+ * destructive target is pinned: `CADENCE_DESTRUCTIVE_OK` must name the exact
+ * host in DATABASE_URL. Repoint DATABASE_URL at staging or production without
+ * also editing that variable and this refuses to run.
+ *
+ * That ordering matters. A guard you disable with a flag gets disabled out of
+ * habit; a guard that requires editing a second file gets read first.
  */
 
 const DEMO_EMAIL_DOMAIN = '@cadence.test'
@@ -49,15 +55,20 @@ const TEARDOWN = `
   -- cascade or the drop fails.
   drop schema if exists app cascade;
 
-  delete from supabase_migrations.schema_migrations
-  where name in (
-    'extensions_and_types', 'tables', 'functions', 'triggers', 'rls', 'plan_catalogue'
-  );
+  -- Guarded: on a project that has never been migrated by either this script
+  -- or the Supabase CLI, the schema does not exist and an unguarded DELETE
+  -- fails with "schema does not exist".
+  do $guard$
+  begin
+    if to_regclass('supabase_migrations.schema_migrations') is not null then
+      delete from supabase_migrations.schema_migrations
+      where name in (
+        'extensions_and_types', 'tables', 'functions', 'triggers', 'rls', 'plan_catalogue'
+      );
+    end if;
+  end
+  $guard$;
 `
-
-function looksLocal(url: string): boolean {
-  return /(@|\/\/)(127\.0\.0\.1|localhost|host\.docker\.internal|db)[:/]/.test(url)
-}
 
 async function main() {
   const url = process.env.DATABASE_URL
@@ -65,14 +76,30 @@ async function main() {
     throw new Error('DATABASE_URL is not set.')
   }
 
-  const force = process.argv.includes('--force')
-  if (!looksLocal(url) && !force) {
+  const host = new URL(url).host
+  const allowed = (process.env.CADENCE_DESTRUCTIVE_OK ?? '').trim()
+
+  if (!allowed) {
     throw new Error(
-      `Refusing to reset a database that does not look local.\n` +
-        `  DATABASE_URL host: ${new URL(url).host}\n` +
-        'Pass --force if you are certain. This drops every Cadence table and all demo users.',
+      'CADENCE_DESTRUCTIVE_OK is not set, so `db:reset` is disabled.\n' +
+        `To allow it, set CADENCE_DESTRUCTIVE_OK to the host you intend to wipe: ${host}`,
     )
   }
+
+  // Compare on host only. The port and the username differ between Supabase's
+  // session and transaction poolers for the same project, and failing on that
+  // difference would teach people to paste whatever the error printed.
+  if (allowed !== host.split(':')[0] && allowed !== host) {
+    throw new Error(
+      'Refusing to reset: DATABASE_URL does not point at the host you authorised.\n' +
+        `  DATABASE_URL host:      ${host}\n` +
+        `  CADENCE_DESTRUCTIVE_OK: ${allowed}\n\n` +
+        'This drops every Cadence table and deletes all @cadence.test auth users. ' +
+        'If you really mean to wipe this database, update CADENCE_DESTRUCTIVE_OK in .env.',
+    )
+  }
+
+  console.log(`Resetting ${host} …`)
 
   const sql = postgres(url, { max: 1, prepare: false, onnotice: () => {} })
 

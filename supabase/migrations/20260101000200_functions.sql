@@ -245,7 +245,18 @@ $$;
 -- BEFORE INSERT triggers in 0003 (the serialised layer). The policy gives a
 -- clean permission denied; the trigger closes the race window between the
 -- count and the insert. Both are needed: neither alone is correct.
-
+--
+-- Both predicates fail CLOSED. If the plan cannot be resolved at all — the
+-- workspace does not exist, or somebody removed the row with key = 'free' that
+-- effective_plan_id() falls back to — the answer is "no", not "unlimited".
+--
+-- The distinction is easy to lose. `max_projects IS NULL` legitimately means
+-- unlimited, and an unresolvable plan also produces NULL for that column, so
+-- the obvious formulation (`when max_projects is null then true`) reads a
+-- missing plan as an unlimited one and silently switches every limit in the
+-- product off. The outer coalesce is what separates the two cases: a resolved
+-- plan yields a boolean from the inner select, an unresolved one yields no row
+-- at all and lands on `false`.
 create or replace function app.can_add_project(p_workspace_id uuid)
 returns boolean
 language sql
@@ -253,11 +264,17 @@ stable
 security definer
 set search_path = ''
 as $$
-  select case
-    when (app.effective_plan(p_workspace_id)).max_projects is null then true
-    else app.workspace_project_count(p_workspace_id)
-         < (app.effective_plan(p_workspace_id)).max_projects
-  end;
+  select coalesce(
+    (
+      select case
+               when p.max_projects is null then true
+               else app.workspace_project_count(p_workspace_id) < p.max_projects
+             end
+        from public.plans p
+       where p.id = app.effective_plan_id(p_workspace_id)
+    ),
+    false
+  );
 $$;
 
 
@@ -268,11 +285,17 @@ stable
 security definer
 set search_path = ''
 as $$
-  select case
-    when (app.effective_plan(p_workspace_id)).max_seats is null then true
-    else app.workspace_seat_count(p_workspace_id)
-         < (app.effective_plan(p_workspace_id)).max_seats
-  end;
+  select coalesce(
+    (
+      select case
+               when p.max_seats is null then true
+               else app.workspace_seat_count(p_workspace_id) < p.max_seats
+             end
+        from public.plans p
+       where p.id = app.effective_plan_id(p_workspace_id)
+    ),
+    false
+  );
 $$;
 
 

@@ -19,6 +19,7 @@
 --   CD001  project limit exceeded
 --   CD002  seat limit exceeded
 --   CD003  workspace limit exceeded
+--   CD004  plan could not be resolved (fail-closed; should never fire)
 -- ===========================================================================
 
 
@@ -105,6 +106,23 @@ $$;
 create trigger on_auth_user_created
   after insert on auth.users
   for each row execute function app.handle_new_auth_user();
+
+
+-- Backfill for accounts that predate this trigger.
+--
+-- The trigger only fires on INSERT, so on a Supabase project that already has
+-- users — which a hosted development project generally does — every one of
+-- them would be left without a profile, and the first thing they would hit is
+-- a foreign key violation on workspaces.owner_id. Running the backfill here
+-- rather than in the seed script means it also covers a project migrated but
+-- never seeded.
+insert into public.profiles (id, email, full_name, avatar_url)
+select u.id,
+       coalesce(u.email, ''),
+       nullif(u.raw_user_meta_data ->> 'full_name', ''),
+       nullif(u.raw_user_meta_data ->> 'avatar_url', '')
+  from auth.users u
+on conflict (id) do nothing;
 
 
 -- The owner is a member. Making this a trigger rather than two inserts in
@@ -250,6 +268,16 @@ begin
 
   v_plan := app.effective_plan(new.workspace_id);
 
+  -- An unresolvable plan leaves every column of v_plan NULL, which the next
+  -- test would read as "unlimited". Refuse instead: a limit check that cannot
+  -- find the limit has failed, and failing open is how a plan limit quietly
+  -- stops existing.
+  if v_plan.id is null then
+    raise exception 'could not resolve a plan for workspace %', new.workspace_id
+      using errcode = 'CD004',
+            hint = 'The plans table is missing the row with key = ''free''.';
+  end if;
+
   if v_plan.max_projects is null then
     return new;
   end if;
@@ -294,6 +322,13 @@ begin
   perform pg_advisory_xact_lock(hashtext('cadence:seats'), hashtext(new.workspace_id::text));
 
   v_plan := app.effective_plan(new.workspace_id);
+
+  -- Same fail-closed reasoning as the project limit above.
+  if v_plan.id is null then
+    raise exception 'could not resolve a plan for workspace %', new.workspace_id
+      using errcode = 'CD004',
+            hint = 'The plans table is missing the row with key = ''free''.';
+  end if;
 
   if v_plan.max_seats is null then
     return new;

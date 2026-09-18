@@ -423,14 +423,33 @@ insert into public.billing_config (id) values (true);
 
 -- Append-only. Every privileged mutation writes here: manual plan grants,
 -- webhook replays, forced downgrades, reconciliation repairs.
+--
+-- actor_id and workspace_id are deliberately NOT foreign keys.
+--
+-- Two reasons, one principled and one mechanical. The principled one: an audit
+-- entry has to outlive its subject. "Who deleted this workspace, and why" is
+-- precisely the question you ask after the workspace is gone, and a cascade or
+-- a SET NULL destroys the answer at the moment it becomes interesting.
+--
+-- The mechanical one is what forces the issue. `on delete set null` is
+-- implemented as an UPDATE against this table, and the append-only trigger
+-- below rejects UPDATE from everyone. So an FK here does not merely lose
+-- history — it makes `delete from workspaces` fail outright with
+-- "audit_log is append-only", which is a baffling error to debug from the far
+-- end of a cascade. `on delete cascade` fares no better: that is a DELETE, and
+-- the same trigger rejects it.
+--
+-- Referential integrity is traded for durability on purpose. Reads join
+-- leniently and tolerate a missing counterparty, which is why actor_email is
+-- captured inline rather than resolved through the profile at read time.
 create table public.audit_log (
   id           uuid        primary key default gen_random_uuid(),
   actor_type   public.audit_actor_type not null,
-  actor_id     uuid        references public.profiles (id) on delete set null,
+  actor_id     uuid,
   -- Captured at write time: the actor may later be deleted, and an audit trail
   -- that forgets who acted is not an audit trail.
   actor_email  text,
-  workspace_id uuid        references public.workspaces (id) on delete set null,
+  workspace_id uuid,
   -- Dotted verb, e.g. 'billing.plan_granted', 'webhook.replayed'.
   action       text        not null,
   -- Required for manual overrides; the /admin form will not submit without it.
