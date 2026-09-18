@@ -1,4 +1,4 @@
-import { relations } from 'drizzle-orm'
+import { eq, relations } from 'drizzle-orm'
 import {
   boolean,
   index,
@@ -63,9 +63,10 @@ export const planPrices = pgTable(
   },
   (table) => [
     // Historical prices accumulate; one active price per interval per mode.
+    // `.where()` takes an SQL predicate, not a bare column reference.
     uniqueIndex('plan_prices_one_active_per_interval')
       .on(table.planId, table.interval, table.livemode)
-      .where(table.isActive),
+      .where(eq(table.isActive, true)),
     index('plan_prices_plan_id_idx').on(table.planId),
   ],
 )

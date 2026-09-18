@@ -2,15 +2,15 @@
   "name": "cadence-billing",
   "version": "0.1.0",
   "private": true,
-  "description": "Cadence — a reference implementation of production-grade Stripe subscription billing on Next.js + Supabase.",
+  "description": "Cadence \u2014 a reference implementation of production-grade Stripe subscription billing on Next.js + Supabase.",
   "engines": {
     "node": ">=20.11"
   },
   "packageManager": "pnpm@9.12.3",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
+    "dev": "node api.js && next dev",
+    "build": "node api.js && next build",
+    "start": "node api.js && next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "db:migrate": "tsx scripts/migrate.ts",
