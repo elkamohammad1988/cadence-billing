@@ -1,26 +1,14 @@
--- ===========================================================================
--- 0003 — Triggers
--- ===========================================================================
--- Two kinds live here:
+-- 0003 — Triggers: housekeeping, and the serialised half of limit enforcement.
 --
---   * housekeeping    — updated_at, profile creation, denormalisation
---   * limit enforcement — the serialised half of entitlement enforcement
+-- An RLS WITH CHECK that counts rows is racy: two concurrent inserts can both
+-- observe "2 projects, limit 3" and both commit, landing at 4. The policy is
+-- still worth having, but the trigger is what makes the limit true. The
+-- advisory lock is keyed on the workspace, so inserts into different
+-- workspaces do not contend.
 --
--- On the second: an RLS WITH CHECK clause that counts rows is racy. Two
--- concurrent inserts can both observe "2 projects, limit 3" and both commit,
--- landing at 4. The policy is still worth having — it produces a clean
--- permission-denied and documents intent — but the trigger is what makes the
--- limit true. It takes a transaction-scoped advisory lock keyed on the
--- workspace, so concurrent inserts into the same workspace serialise while
--- inserts into different workspaces do not contend.
---
--- Error codes (class CD is unused by the SQL standard, so these cannot be
--- confused with a built-in failure):
---   CD001  project limit exceeded
---   CD002  seat limit exceeded
---   CD003  workspace limit exceeded
---   CD004  plan could not be resolved (fail-closed; should never fire)
--- ===========================================================================
+-- Error codes (class CD is unused by the SQL standard):
+--   CD001 project limit   CD002 seat limit   CD003 workspace limit
+--   CD004 plan unresolvable (fail-closed; should never fire)
 
 
 -- --- Housekeeping ----------------------------------------------------------
@@ -198,40 +186,24 @@ create trigger audit_log_append_only
   for each row execute function app.reject_mutation();
 
 
--- --- Limit enforcement -----------------------------------------------------
-
--- Escape hatch for privileged writes that legitimately need to land a row the
--- current plan would refuse: the seed building workspaces before their
--- subscriptions exist, reconciliation repairing a row to match Stripe, an
--- audited admin grant.
+-- Escape hatch for privileged writes that must land a row the current plan
+-- would refuse: the seed, reconciliation repairing a row to match Stripe, an
+-- audited admin grant. The only supported way in; callers never touch the GUC.
 --
--- The only supported way in is app.begin_privileged_writes(). Callers never
--- touch the GUC; the helper sets it, and sets it transaction-locally.
+-- Guarantees two things. A caller arriving through PostgREST cannot bypass a
+-- limit, whatever key it holds, because session_user is `authenticator` there.
+-- And a bypass cannot leak across a pooled connection: the token is the
+-- transaction id, so a GUC set session-wide by mistake authorises nothing once
+-- that transaction ends.
 --
--- What this guarantees, precisely:
---
---   * A caller arriving through PostgREST cannot bypass a limit, whatever key
---     it holds, because session_user is `authenticator` there rather than
---     `postgres`. Note this is a much smaller claim than it sounds: a request
---     holding the service-role key already bypasses all of RLS and can read
---     and write every tenant's billing data. Blocking it from exceeding a
---     project quota is not a security boundary, it is a guard against
---     accidental limit-busting from the REST path.
---
---   * A bypass cannot leak across a pooled connection. This is the property
---     worth having, and it is why the token is the transaction id rather than
---     a constant. Set the GUC session-wide by mistake and it authorises
---     nothing after the current transaction commits, because every later
---     transaction has a different id.
---
--- What it does not guarantee: anything at all against code that already holds
--- a direct `postgres` connection. Such code can call the helper itself. The
--- boundary is the connection, not the function.
+-- Guarantees nothing against code already holding a direct `postgres`
+-- connection — it can call this itself. The boundary is the connection. Nor is
+-- the PostgREST check a security boundary: a service-role key already bypasses
+-- all of RLS, so this only guards against accidental limit-busting.
 --
 -- session_user, not current_user: the callers are SECURITY DEFINER triggers,
--- and inside those current_user has already been rewritten to the function
--- owner (`postgres`), so reading it would return `postgres` for every caller
--- and pass for everyone. session_user is untouched by SECURITY DEFINER.
+-- where current_user has already been rewritten to the owner (`postgres`) and
+-- would pass for everyone.
 create or replace function app.begin_privileged_writes()
 returns void
 language plpgsql

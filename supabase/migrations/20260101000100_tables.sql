@@ -432,24 +432,13 @@ insert into public.billing_config (id) values (true);
 -- Append-only. Every privileged mutation writes here: manual plan grants,
 -- webhook replays, forced downgrades, reconciliation repairs.
 --
--- actor_id and workspace_id are deliberately NOT foreign keys.
---
--- Two reasons, one principled and one mechanical. The principled one: an audit
--- entry has to outlive its subject. "Who deleted this workspace, and why" is
--- precisely the question you ask after the workspace is gone, and a cascade or
--- a SET NULL destroys the answer at the moment it becomes interesting.
---
--- The mechanical one is what forces the issue. `on delete set null` is
--- implemented as an UPDATE against this table, and the append-only trigger
--- below rejects UPDATE from everyone. So an FK here does not merely lose
--- history — it makes `delete from workspaces` fail outright with
--- "audit_log is append-only", which is a baffling error to debug from the far
--- end of a cascade. `on delete cascade` fares no better: that is a DELETE, and
--- the same trigger rejects it.
---
--- Referential integrity is traded for durability on purpose. Reads join
--- leniently and tolerate a missing counterparty, which is why actor_email is
--- captured inline rather than resolved through the profile at read time.
+-- actor_id and workspace_id are deliberately NOT foreign keys. An audit entry
+-- has to outlive its subject — "who deleted this workspace" is the question you
+-- ask once it is gone. And mechanically an FK cannot work: `on delete set null`
+-- is an UPDATE and `on delete cascade` is a DELETE, both of which the
+-- append-only trigger rejects, so either would make `delete from workspaces`
+-- fail outright. Reads must join leniently; actor_email is captured inline
+-- rather than resolved through the profile at read time.
 create table public.audit_log (
   id           uuid        primary key default gen_random_uuid(),
   actor_type   public.audit_actor_type not null,

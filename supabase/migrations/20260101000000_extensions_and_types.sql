@@ -1,10 +1,8 @@
--- ===========================================================================
 -- 0000 — Extensions, schemas and enumerated types
--- ===========================================================================
--- `app` holds SECURITY DEFINER helper functions used by Row Level Security
--- policies. It is deliberately NOT in PostgREST's exposed schema list, so
--- nothing in here is reachable over the REST API — only from inside SQL.
--- ===========================================================================
+--
+-- `app` holds the SECURITY DEFINER helpers that RLS policies call. It is
+-- deliberately absent from PostgREST's exposed schema list, so nothing in it
+-- is reachable over HTTP whatever key the caller holds.
 
 create extension if not exists pgcrypto with schema extensions;
 
@@ -14,11 +12,8 @@ revoke all on schema app from public;
 grant usage on schema app to authenticated, service_role;
 
 
--- --- Enumerated types ------------------------------------------------------
-
--- Mirrors Stripe's subscription.status verbatim. We never invent statuses:
--- the local row is a projection of Stripe, so the vocabulary has to match or
--- reconciliation becomes a translation exercise.
+-- Mirrors Stripe's subscription.status verbatim. Inventing a status would make
+-- reconciliation a translation exercise.
 create type public.subscription_status as enum (
   'incomplete',
   'incomplete_expired',
@@ -32,9 +27,7 @@ create type public.subscription_status as enum (
 
 create type public.billing_interval as enum ('month', 'year');
 
--- 'stripe'  — the row is owned by Stripe; reconciliation may overwrite it.
--- 'manual'  — an admin granted this plan without payment. Reconciliation
---             leaves it alone; only an admin can revoke it.
+-- 'manual' rows are admin grants: reconciliation leaves them alone.
 create type public.subscription_source as enum ('stripe', 'manual');
 
 create type public.workspace_role as enum ('owner', 'admin', 'member');
@@ -47,13 +40,8 @@ create type public.invoice_status as enum (
   'void'
 );
 
--- Lifecycle of a webhook delivery.
---   received   — persisted, not yet picked up
---   processing — a handler holds it (guards against concurrent delivery)
---   processed  — handler returned cleanly
---   failed     — handler threw; `error` is populated; replayable from /admin
---   skipped    — deliberately not handled (event type we do not subscribe to,
---                or a customer we do not know about). Not an error.
+-- 'skipped' is not a failure: an event type we do not subscribe to, or a
+-- customer we have never seen.
 create type public.stripe_event_status as enum (
   'received',
   'processing',

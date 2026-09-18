@@ -1,28 +1,14 @@
--- ===========================================================================
 -- 0005 — Plan catalogue
--- ===========================================================================
--- Packaging is a product decision, so it is versioned here rather than left to
--- a script. Pricing is not: `plan_prices` rows are written by
--- `pnpm stripe:sync-plans` from the Stripe catalogue, so an amount can change
--- without a migration or a deploy.
 --
--- stripe_product_id is filled in by the same sync. Free has none — there is
--- nothing to charge for.
+-- Packaging is versioned here; pricing is not. `plan_prices` and
+-- `stripe_product_id` are written by `pnpm stripe:sync-plans`, so an amount
+-- changes without a deploy. See docs/ARCHITECTURE.md.
 --
--- Limit semantics: NULL is unlimited.
+-- NULL on a limit column means unlimited. 0 would mean none allowed.
 --
--- Two judgement calls that are not dictated by the pricing table:
---
---   * AI is on from Pro upward. The brief only states that Free has no AI;
---     putting it on Starter would leave Pro's $30 step carrying nothing but
---     project headroom.
---   * max_workspaces for Pro is 10 and unlimited for Business. The brief
---     specifies workspace counts only for Free and Starter. Pro's ceiling
---     matches its seat count, which keeps the "a team, not an org" framing.
---
--- Both are one UPDATE away from being something else — that is the point of
--- keeping limits in a table.
--- ===========================================================================
+-- Two judgement calls the brief does not dictate: AI is on from Pro upward
+-- (otherwise Pro's $30 step carries only project headroom), and Pro's
+-- max_workspaces of 10 matches its seat count.
 
 insert into public.plans (
   key, name, tagline, sort_order,
