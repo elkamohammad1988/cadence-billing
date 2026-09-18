@@ -3,8 +3,6 @@ node_modules/
 out/
 build/
 dist/
-.env
-.env.local
 .env*.local
 !.env.example
 *.tsbuildinfo
@@ -17,3 +15,8 @@ supabase/.branches/
 supabase/.temp/
 .vercel
 .kilo/
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
+config.bat

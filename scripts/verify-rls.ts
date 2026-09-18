@@ -88,11 +88,14 @@ async function main() {
 
     console.log(`\nEnvironment`)
     console.log(`  database host   ${new URL(databaseUrl).host}`)
-    const [{ session_user: sessionUser, current_user: currentUser }] = await sql<
-      { session_user: string; current_user: string }[]
-    >`select session_user, current_user`
-    console.log(`  session_user    ${sessionUser}`)
-    console.log(`  current_user    ${currentUser}`)
+    const [roles] = await sql<{ session_user: string; current_user: string }[]>`
+      select session_user, current_user
+    `
+    // session_user is what app.limits_bypassed() keys on, so it is worth
+    // printing before anything else: if this is not `postgres`, several checks
+    // below will fail for that reason alone.
+    console.log(`  session_user    ${roles?.session_user ?? '?'}`)
+    console.log(`  current_user    ${roles?.current_user ?? '?'}`)
 
     // --- 1. A member reads their own billing rows ------------------------
     console.log(`\n1. Tenant can read its own billing data`)
