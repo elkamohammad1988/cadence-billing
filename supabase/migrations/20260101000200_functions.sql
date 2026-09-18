@@ -321,6 +321,70 @@ as $$
 $$;
 
 
+-- --- Catalogue writes ------------------------------------------------------
+--
+-- The single supported way to publish a price. `pnpm stripe:sync-plans` calls
+-- this once per price; the seed calls it for its placeholders.
+--
+-- Deactivating before inserting is not stylistic. The partial unique index
+-- allows one active row per (plan, interval, livemode), so inserting a new
+-- active price while the old one is still active raises a unique violation —
+-- which is exactly what a naive sync does on its second run, and what an
+-- upsert that force-sets is_active does when it reactivates a superseded
+-- placeholder. Both orderings happen inside one transaction here, and the
+-- index is checked per statement, so the intermediate state is legal.
+create or replace function app.set_active_plan_price(
+  p_plan_key        text,
+  p_interval        public.billing_interval,
+  p_stripe_price_id text,
+  p_unit_amount     integer,
+  p_currency        text default 'usd',
+  p_livemode        boolean default false
+)
+returns uuid
+language plpgsql
+volatile
+security definer
+set search_path = ''
+as $$
+declare
+  v_plan_id uuid;
+  v_id      uuid;
+begin
+  select p.id into v_plan_id from public.plans p where p.key = p_plan_key;
+
+  if v_plan_id is null then
+    raise exception 'unknown plan key %', p_plan_key using errcode = '23503';
+  end if;
+
+  update public.plan_prices
+     set is_active = false
+   where plan_id = v_plan_id
+     and "interval" = p_interval
+     and livemode = p_livemode
+     and is_active
+     and stripe_price_id is distinct from p_stripe_price_id;
+
+  insert into public.plan_prices
+    (plan_id, "interval", stripe_price_id, unit_amount, currency, livemode, is_active)
+  values
+    (v_plan_id, p_interval, p_stripe_price_id, p_unit_amount, p_currency, p_livemode, true)
+  on conflict (stripe_price_id) do update
+     set unit_amount = excluded.unit_amount,
+         currency    = excluded.currency,
+         livemode    = excluded.livemode,
+         is_active   = true
+  returning id into v_id;
+
+  return v_id;
+end;
+$$;
+
+revoke execute on function app.set_active_plan_price(
+  text, public.billing_interval, text, integer, text, boolean
+) from public;
+
+
 -- --- Webhook ordering ------------------------------------------------------
 --
 -- Stripe makes no ordering guarantee. A subscription.updated generated at

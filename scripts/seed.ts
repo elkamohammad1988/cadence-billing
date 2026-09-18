@@ -171,18 +171,21 @@ async function main() {
         `
       }
 
+      // Goes through the catalogue helper rather than an ad-hoc upsert: it
+      // deactivates any superseded price for the same plan/interval/mode in
+      // the same transaction, which is the ordering the partial unique index
+      // requires. Seeded prices are always test-mode.
       const priceIds = new Map<string, string>()
       for (const price of SEED_PRICES) {
         const [row] = await tx<{ id: string }[]>`
-          insert into public.plan_prices (plan_id, "interval", stripe_price_id, unit_amount)
-          select p.id, ${price.interval}::public.billing_interval,
-                 ${price.stripePriceId}, ${price.unitAmount}
-            from public.plans p
-           where p.key = ${price.planKey}
-          on conflict (stripe_price_id) do update
-            set unit_amount = excluded.unit_amount,
-                is_active = true
-          returning id
+          select app.set_active_plan_price(
+            ${price.planKey},
+            ${price.interval}::public.billing_interval,
+            ${price.stripePriceId},
+            ${price.unitAmount},
+            'usd',
+            false
+          ) as id
         `
         priceIds.set(`${price.planKey}:${price.interval}`, row!.id)
       }

@@ -82,6 +82,12 @@ create table public.plan_prices (
   -- Minor units, as Stripe stores them. 1900 = $19.00.
   unit_amount        integer           not null,
   currency           text              not null default 'usd',
+  -- Mirrors Stripe's own `livemode`. Test-mode and live-mode price ids are
+  -- different objects, and both need to exist here at once: going live must
+  -- not mean destroying the test catalogue that every demo and every test
+  -- depends on. Checkout picks the row matching the mode of the secret key
+  -- in use.
+  livemode           boolean           not null default false,
   is_active          boolean           not null default true,
   created_at         timestamptz       not null default now(),
   updated_at         timestamptz       not null default now(),
@@ -89,10 +95,12 @@ create table public.plan_prices (
   constraint plan_prices_amount_nonnegative check (unit_amount >= 0)
 );
 
--- A plan may accumulate historical prices, but only one active price per
--- interval — that is the one Checkout uses.
+-- A plan accumulates historical prices, but only one active price per interval
+-- per mode — that is the one Checkout uses. Writes go through
+-- app.set_active_plan_price(), which deactivates before inserting; doing it in
+-- the other order collides with this index.
 create unique index plan_prices_one_active_per_interval
-  on public.plan_prices (plan_id, "interval")
+  on public.plan_prices (plan_id, "interval", livemode)
   where is_active;
 
 create index plan_prices_plan_id_idx on public.plan_prices (plan_id);

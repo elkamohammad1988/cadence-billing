@@ -55,14 +55,16 @@ export const planPrices = pgTable(
     /** Minor units, as Stripe stores them. 1900 = $19.00. */
     unitAmount: integer('unit_amount').notNull(),
     currency: text('currency').notNull().default('usd'),
+    /** Mirrors Stripe's own `livemode`; test and live prices coexist here. */
+    livemode: boolean('livemode').notNull().default(false),
     isActive: boolean('is_active').notNull().default(true),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
-    // Historical prices may accumulate, but only one active price per interval.
+    // Historical prices accumulate; one active price per interval per mode.
     uniqueIndex('plan_prices_one_active_per_interval')
-      .on(table.planId, table.interval)
+      .on(table.planId, table.interval, table.livemode)
       .where(table.isActive),
     index('plan_prices_plan_id_idx').on(table.planId),
   ],
